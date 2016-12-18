@@ -1,39 +1,119 @@
 #!/bin/bash
 # need sudo apt-get install multipath-tools
+set -e
+set -x
+if [ $# -ne 4 ]; then
+	echo "USAGE: $0 <soc_type> <path to rootfs> <path to u-boot.sb or u-boot.sd> <path to img file>"
+    echo "<soc_type> should be either mx23 or mx28"
 
-echo "USAGE: $0 <path to rootfs> <img file>"
-if [ $# -ne 2 ]
-then
-  exit 1
+	exit 1
 fi
 
-IMGFILE="$2"
-ROOTFS="$1"
+ROOTFS="$2"
+UBOOT="$3"
+IMGFILE="$4"
+
+UBOOT_BASENAME=$(basename "$UBOOT")
+
+case "$1" in
+    "mx23")
+        SOC_TYPE="MX23"
+        ;;
+    "mx28")
+        SOC_TYPE="MX28"
+        ;;
+    *)
+        echo "Can't determine SoC type"
+esac
+
+
+if [ "$IMGFILE" == "/dev/sda" ]; then
+	echo "Attempt to rewrite sda part table";
+	exit 1
+fi
+
+if [ "$(id -u)" != "0" ]; then
+    echo "This script must be run as root"
+    exec sudo "$0" "$@"
+fi
+
+PATH=/sbin:$PATH
+SECTOR_SIZE=512
+MB=1024*1024
 
 # create image file
-dd if=/dev/zero of=$IMGFILE bs=1M count=700
-sudo ./create_partitions.sh  $IMGFILE
+DATASIZE=`sudo du -sm $ROOTFS | cut -f1`
+IMGSIZE=$[DATASIZE + 250] # in megabytes
+TOTAL_SECTORS=$[IMGSIZE*MB/SECTOR_SIZE]
+echo "IMGSIZE: $IMGSIZE"
 
-if [ -e /dev/mapper/loop0p1 ]; then
-	echo "/dev/mapper/loop0p1 already exists"
-	exit 2;
-fi
+PART_START_MX23=$[4*MB/SECTOR_SIZE]
+write_uboot_MX23() {
+	sudo dd if=$UBOOT of=${DEV}1 bs=$SECTOR_SIZE seek=4
+}
 
-if [ -e /dev/mapper/loop0p2 ]; then
-	echo "/dev/mapper/loop0p2 already exists"
-	exit 2;
-fi
+PART_START_MX28=$[1*MB/SECTOR_SIZE]
+write_uboot_MX28() {
+	sudo dd if=$UBOOT of=${DEV}1
+}
 
-sudo kpartx -a $IMGFILE
+eval "PART_START=\${PART_START_${SOC_TYPE}}"
 
-sudo ./create_fs.sh  /dev/mapper/loop0p2
-sudo dd if=../contrib/u-boot/u-boot.sb of=/dev/mapper/loop0p1 bs=512 seek=4
+truncate -s ${IMGSIZE}M $IMGFILE
 
+# Generates single partition definition line for sfdisk.
+# Increments PART_START variable to point to the start of the next partition
+# (special case is Extended (5) fstype, which increments PART_START by 2048 sectors)
+# Args:
+# - size in megabytes (or '' to use all remaining space to the end)
+# - filesystem type (looks like not really matters). when omitted, defaults to 83 (Linux)
+wb_partition()
+{
+    [[ -z "$1" ]] &&
+        local size=$[TOTAL_SECTORS-PART_START] ||
+        local size=$[$1*MB/SECTOR_SIZE]
+    local fstype=${2:-83}
+    echo "$PART_START $size $fstype"
+    [[ "$fstype" == 5 ]] && ((PART_START+=2048)) || ((PART_START+=$size))
+}
+
+dd if=/dev/zero of=$IMGFILE bs=1M count=5 conv=notrunc,fdatasync
+{
+	wb_partition 16 53
+	wb_partition
+} | sfdisk  --Linux --unit=S  $IMGFILE
+
+sync
+
+DEV=/dev/mapper/`sudo kpartx -av $IMGFILE | sed -rn 's#.* (loop[0-9]+p).*#\1#p; q'`
+sync
+sleep 3
+
+write_uboot_${SOC_TYPE}
+
+ls -lh  ${DEV}2
+
+E2FS_FEATURES=has_journal,ext_attr,resize_inode,dir_index,filetype,extent,flex_bg,sparse_super,large_file,huge_file,uninit_bg,dir_nlink,extra_isize
+sudo mkfs.ext4 ${DEV}2 -E stride=2,stripe-width=1024 -Onone,$E2FS_FEATURES,^64bit -b 4096 -L rootfs
 MOUNTPOINT=`mktemp -d`
-sudo mount /dev/mapper/loop0p2 $MOUNTPOINT
-sudo cp -rp $ROOTFS/. $MOUNTPOINT/
-sync
-sync
-sudo umount $MOUNTPOINT
-sudo rmdir $MOUNTPOINT
-sudo kpartx -d $IMGFILE
+sudo mount ${DEV}2 $MOUNTPOINT/
+
+cleanup() {
+	sudo umount $MOUNTPOINT
+	sudo rmdir $MOUNTPOINT
+	sync
+	sync
+	sudo kpartx -d $IMGFILE
+}
+trap cleanup EXIT
+
+# remove some usual development garbage
+chroot $ROOTFS apt-get clean || true
+rm -rf $ROOTFS/run/* $ROOTFS/var/cache/apt/archives/* $ROOTFS/var/lib/apt/lists/* \
+	$ROOTFS/usr/sbin/policy-rc.d \
+	$ROOTFS/*.deb
+
+sudo cp -a $ROOTFS/. $MOUNTPOINT/
+
+echo "Done!"
+exit 0
